@@ -24,6 +24,8 @@ pub fn execute(args: InitArgs) -> Result<()> {
         trace_dir.join(format!("{}.db", args.prefix))
     };
 
+    // Init shares the same local lock as all other database commands.
+    let _sync = tracer::sync::SyncSession::open(&db_path)?;
     // Create the database (schema is auto-initialized)
     let mut storage = tracer::storage::sqlite::SqliteStorage::new(&db_path)?;
     
@@ -41,4 +43,3 @@ pub fn execute(args: InitArgs) -> Result<()> {
 
     Ok(())
 }
-

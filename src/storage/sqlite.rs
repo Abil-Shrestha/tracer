@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+mod sync;
+
 pub struct SqliteStorage {
     conn: Connection,
 }
@@ -32,6 +34,7 @@ impl SqliteStorage {
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_tables(conn)?;
+        sync::migrate(conn)?;
         Ok(())
     }
 
@@ -138,8 +141,8 @@ impl SqliteStorage {
 
     fn add_event(&mut self, issue_id: &str, event_type: EventType, actor: &str, old_value: Option<&str>, new_value: Option<&str>, comment: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at, sync_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, lower(hex(randomblob(16))))",
             params![
                 issue_id,
                 event_type.to_string(),
@@ -797,12 +800,13 @@ impl Storage for SqliteStorage {
 
     fn add_comment(&mut self, issue_id: &str, actor: &str, comment: &str) -> Result<()> {
         self.add_event(issue_id, EventType::Commented, actor, None, None, Some(comment))?;
+        self.mark_dirty(issue_id)?;
         Ok(())
     }
 
     fn get_events(&self, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+            "SELECT COALESCE(original_id, id), issue_id, event_type, actor, old_value, new_value, comment, created_at
              FROM events
              WHERE issue_id = ?1
              ORDER BY created_at DESC
@@ -868,6 +872,21 @@ impl Storage for SqliteStorage {
             ready_issues: ready,
             average_lead_time_hours: avg_lead_time,
         })
+    }
+
+    fn sync_snapshot(&self) -> Result<Vec<crate::sync::SyncRecord>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let records = self.read_sync_records()?;
+        tx.commit()?;
+        Ok(records)
+    }
+
+    fn import_snapshot(&mut self, records: &[crate::sync::SyncRecord], options: crate::sync::ImportOptions, file_hash: Option<&str>) -> Result<crate::sync::ImportSummary> {
+        self.apply_snapshot(records, options, file_hash)
+    }
+
+    fn acknowledge_snapshot(&mut self, records: &[crate::sync::SyncRecord], file_hash: &str) -> Result<()> {
+        self.acknowledge_sync(records, file_hash)
     }
 
     fn get_dirty_issues(&self) -> Result<Vec<String>> {
@@ -1072,4 +1091,3 @@ CREATE INDEX IF NOT EXISTS idx_labels_issue ON labels(issue_id);
 CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
 CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
 "#;
-

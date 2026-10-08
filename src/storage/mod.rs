@@ -48,6 +48,11 @@ pub trait Storage {
     // Statistics
     fn get_statistics(&self) -> Result<Statistics>;
 
+    // Lossless synchronization. Implementations must import/acknowledge atomically.
+    fn sync_snapshot(&self) -> Result<Vec<crate::sync::SyncRecord>>;
+    fn import_snapshot(&mut self, records: &[crate::sync::SyncRecord], options: crate::sync::ImportOptions, file_hash: Option<&str>) -> Result<crate::sync::ImportSummary>;
+    fn acknowledge_snapshot(&mut self, records: &[crate::sync::SyncRecord], file_hash: &str) -> Result<()>;
+
     // Dirty tracking (for incremental JSONL export)
     fn get_dirty_issues(&self) -> Result<Vec<String>>;
     fn clear_dirty_issues(&mut self) -> Result<()>;
@@ -80,4 +85,3 @@ pub struct IssueUpdates {
     pub estimated_minutes: Option<Option<i32>>, // None = don't update, Some(None) = clear field
     pub external_ref: Option<Option<String>>,
 }
-

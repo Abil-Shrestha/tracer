@@ -32,19 +32,8 @@ pub fn find_database_path() -> Result<PathBuf> {
 /// Find the JSONL path for a given database path
 pub fn find_jsonl_path(db_path: &Path) -> PathBuf {
     let parent = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    
-    // Look for existing .jsonl files
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension() {
-                if ext == "jsonl" {
-                    return entry.path();
-                }
-            }
-        }
-    }
-    
-    // Default to issues.jsonl
+
+    // Backups and filtered exports must never become the managed sync file.
     parent.join("issues.jsonl")
 }
 
@@ -153,4 +142,3 @@ pub fn compute_hash(data: &[u8]) -> String {
     hasher.update(data);
     hex::encode(hasher.finalize())
 }
-

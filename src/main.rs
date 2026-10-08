@@ -2,7 +2,7 @@ mod cli;
 
 use anyhow::Result;
 use clap::Parser;
-use tracer::{find_database_path, find_jsonl_path, storage::sqlite::SqliteStorage};
+use tracer::{find_database_path, storage::sqlite::SqliteStorage, sync::SyncSession};
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
@@ -24,7 +24,8 @@ fn main() -> Result<()> {
         find_database_path()?
     };
 
-    // Open storage
+    // Serialize the entire local read/import/mutate/publish/acknowledge cycle.
+    let mut sync = SyncSession::open(&db_path)?;
     let mut storage: Box<dyn tracer::Storage> = Box::new(SqliteStorage::new(&db_path)?);
 
     // Get actor name
@@ -37,10 +38,13 @@ fn main() -> Result<()> {
     // Get prefix from config or default to "bd"
     let prefix = storage.get_config("prefix")?.unwrap_or_else(|| "bd".to_string());
 
-    // Auto-import if JSONL is newer
-    let jsonl_path = find_jsonl_path(&db_path);
-    if jsonl_path.exists() {
-        let _ = cli::export::auto_import(&mut storage, &jsonl_path, &actor);
+    // Explicit export is a local backup, and import is also the recovery path.
+    // Neither may be blocked by an invalid/conflicting managed JSONL file.
+    let explicit_sync = matches!(&cli.command, cli::Commands::Import(_) | cli::Commands::Export(_));
+    let no_publish = matches!(&cli.command, cli::Commands::Export(_))
+        || matches!(&cli.command, cli::Commands::Import(args) if args.dry_run);
+    if !explicit_sync {
+        sync.import(storage.as_mut())?;
     }
 
     // Execute command
@@ -110,7 +114,7 @@ fn main() -> Result<()> {
         }
         
         cli::Commands::Import(args) => {
-            cli::export::execute_import(args, &mut storage, &actor)
+            cli::export::execute_import(args, &mut storage)
         }
         
         cli::Commands::Stats(args) => {
@@ -118,19 +122,10 @@ fn main() -> Result<()> {
         }
     };
 
-    // Auto-export if there are dirty issues
-    if result.is_ok() {
-        let dirty = storage.get_dirty_issues()?;
-        if !dirty.is_empty() {
-            if let Err(e) = cli::export::auto_export(storage.as_ref(), &jsonl_path) {
-                eprintln!("Warning: Failed to auto-export: {}", e);
-            } else {
-                // Clear dirty flags after successful export
-                storage.clear_dirty_issues()?;
-            }
-        }
+    // Publication failures are command failures. SQLite remains recoverable/dirty.
+    if result.is_ok() && !no_publish {
+        sync.publish(storage.as_mut(), explicit_sync)?;
     }
 
     result
 }
-

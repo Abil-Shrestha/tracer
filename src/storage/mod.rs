@@ -8,6 +8,15 @@ pub trait Storage {
     // Issues
     fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()>;
     fn get_issue(&self, id: &str) -> Result<Option<Issue>>;
+    /// Atomically claim ready work for a nonempty actor. Another owner, a closed/blocked
+    /// status, or an unfinished blocking dependency causes an error without changes.
+    /// Retrying an in-progress claim by the same actor is a no-op if still unblocked.
+    fn claim_issue(&mut self, id: &str, actor: &str) -> Result<()>;
+    /// Clear ownership, returning in-progress work to open but preserving other statuses.
+    /// Only the owner may release unless force is explicitly requested for recovery.
+    fn release_issue(&mut self, id: &str, actor: &str, force: bool) -> Result<()>;
+    /// Administrative mutation, including import/reassignment; not a claim operation.
+    /// Workers must use claim_issue/release_issue for exclusive local ownership.
     fn update_issue(&mut self, id: &str, updates: &IssueUpdates, actor: &str) -> Result<()>;
     fn close_issue(&mut self, id: &str, reason: &str, actor: &str) -> Result<()>;
     fn search_issues(&self, query: &str, filter: &IssueFilter) -> Result<Vec<Issue>>;

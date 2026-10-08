@@ -27,16 +27,60 @@ Recent comments:
   claude-1 (15 min ago): "Started working on the API"
 ```
 
-### 2. Auto-Assign
+### 2. Exclusive local ownership
 
-When an agent changes an issue's status to `in_progress`, they are automatically assigned to it:
+Use a distinct, nonempty actor name for each agent and claim work before starting:
 
 ```bash
-# Agent identifies via --actor flag or $USER
+# Actor comes from --actor, TRACE_ACTOR, or USER, in that order
+tracer --actor claude-1 claim bd-1
+
+# Compatible alias: a status-only update uses the same atomic claim
 tracer --actor claude-1 update bd-1 --status in_progress
 
-# Now claude-1 is automatically assigned to bd-1
+# Owner voluntarily gives the task back
+tracer --actor claude-1 release bd-1
+
+# Manual recovery after confirming the previous worker has stopped
+tracer --actor coordinator release bd-1 --force
 ```
+
+Claim checks readiness and sets `assignee` and `in_progress` in one SQLite
+transaction. It accepts open work with no owner (or already assigned to you).
+It rejects another owner's assignment, closed or explicitly blocked work, and
+any unfinished direct `blocks` dependency. Other dependency types do not block.
+An unowned `in_progress` task is not ready: recover it with an administrative
+status update to `open` before claiming. The same owner's retry on unblocked
+`in_progress` work succeeds without changing timestamps or adding events.
+Conflicts exit nonzero with the owner or blocking reason and leave the issue
+unchanged. `ready` is a discovery snapshot, not a reservation: only a successful
+claim grants ownership.
+
+Release requires the current owner unless `--force` is supplied. It clears the
+assignee and returns `in_progress` to `open`; it preserves `blocked` and `closed`
+statuses, including the closing timestamp. Releasing unassigned work fails.
+There is no lease or expiry. Stop an abandoned worker before forced recovery;
+the command does not terminate or fence that worker.
+
+Ordinary updates do not clear ownership. `update --assignee` requires `--force`;
+an `in_progress` update combined with other fields also requires `--force`.
+Prefer claiming first, then updating metadata. For intentional administrative
+reassignment (which can override readiness and ownership checks), use:
+
+```bash
+tracer --actor coordinator update bd-1 --assignee cursor-2 --status in_progress --force
+```
+
+Forced updates set only the supplied fields; they do not implicitly assign the
+actor. The library's `Storage::update_issue` remains administrative for imports
+and maintenance; workers must use `claim_issue` / `release_issue`.
+
+**Scope:** exclusivity coordinates cooperating agents using the **same local
+SQLite database**. Actor names are identifiers, not authentication. This is not
+a general edit permission system: metadata updates, dependency changes, and
+closing tasks remain collaborative. Imports and explicit administrative writes
+can change ownership. Git/JSONL synchronization does **not** lock tasks across
+disconnected clones or separate databases.
 
 ### 3. Assignee Visibility
 

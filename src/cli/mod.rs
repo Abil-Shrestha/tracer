@@ -1,3 +1,4 @@
+pub mod claim;
 pub mod create;
 pub mod dep;
 pub mod export;
@@ -52,6 +53,12 @@ pub enum Commands {
     
     /// Update an issue
     Update(update::UpdateArgs),
+
+    /// Atomically claim ready work for the current actor
+    Claim(claim::ClaimArgs),
+
+    /// Release ownership (owner-only unless --force is used for recovery)
+    Release(claim::ReleaseArgs),
     
     /// Close an issue
     Close(update::CloseArgs),

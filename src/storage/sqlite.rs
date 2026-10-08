@@ -2,7 +2,7 @@ use super::{IssueUpdates, Storage};
 use crate::types::*;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -213,6 +213,98 @@ impl Storage for SqliteStorage {
             )
             .optional()?;
         Ok(issue)
+    }
+
+    fn claim_issue(&mut self, id: &str, actor: &str) -> Result<()> {
+        if actor.trim().is_empty() {
+            anyhow::bail!("Claim requires a nonempty actor");
+        }
+
+        // Reserve the write lock before checking ownership or blockers. All checks,
+        // the claim, its audit event, and dirty tracking commit together.
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, owner): (String, String) = tx.query_row(
+            "SELECT status, COALESCE(assignee, '') FROM issues WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.ok_or_else(|| anyhow::anyhow!("Issue {} not found", id))?;
+
+        if !owner.is_empty() && owner != actor {
+            anyhow::bail!("Claim conflict for issue {}: owned by '{}'", id, owner);
+        }
+        if status != "open" && !(status == "in_progress" && owner == actor) {
+            anyhow::bail!("Claim conflict for issue {}: status '{}' is not ready", id, status);
+        }
+
+        let blocker: Option<String> = tx.query_row(
+            "SELECT blocker.id FROM dependencies d
+             JOIN issues blocker ON blocker.id = d.depends_on_id
+             WHERE d.issue_id = ?1 AND d.type = 'blocks' AND blocker.status != 'closed'
+             ORDER BY blocker.id LIMIT 1",
+            params![id],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(blocker) = blocker {
+            anyhow::bail!("Claim conflict for issue {}: blocked by {}", id, blocker);
+        }
+
+        // Idempotent retries do not change timestamps or emit duplicate events.
+        if status == "in_progress" && owner == actor {
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        tx.execute(
+            "UPDATE issues SET assignee = ?1, status = 'in_progress', updated_at = ?2,
+             closed_at = NULL WHERE id = ?3",
+            params![actor, now, id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+             VALUES (?1, 'updated', ?2, ?3, ?2, 'Claimed issue', ?4)",
+            params![id, actor, owner, now],
+        )?;
+        tx.execute("INSERT OR IGNORE INTO dirty_issues (issue_id) VALUES (?1)", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn release_issue(&mut self, id: &str, actor: &str, force: bool) -> Result<()> {
+        if actor.trim().is_empty() {
+            anyhow::bail!("Release requires a nonempty actor");
+        }
+
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner: String = tx.query_row(
+            "SELECT COALESCE(assignee, '') FROM issues WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        ).optional()?.ok_or_else(|| anyhow::anyhow!("Issue {} not found", id))?;
+        if owner.is_empty() {
+            anyhow::bail!("Release conflict for issue {}: no owner", id);
+        }
+        if owner != actor && !force {
+            anyhow::bail!(
+                "Release conflict for issue {}: owned by '{}'; use --force only for manual recovery",
+                id, owner
+            );
+        }
+
+        let now = Utc::now();
+        tx.execute(
+            "UPDATE issues SET assignee = NULL,
+             status = CASE WHEN status = 'in_progress' THEN 'open' ELSE status END,
+             updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+             VALUES (?1, 'updated', ?2, ?3, '', ?4, ?5)",
+            params![id, actor, owner, if force { "Force-released issue" } else { "Released issue" }, now],
+        )?;
+        tx.execute("INSERT OR IGNORE INTO dirty_issues (issue_id) VALUES (?1)", params![id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn update_issue(&mut self, id: &str, updates: &IssueUpdates, actor: &str) -> Result<()> {

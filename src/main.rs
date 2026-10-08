@@ -63,6 +63,14 @@ fn main() -> Result<()> {
         cli::Commands::Update(args) => {
             cli::update::execute_update(args, &mut storage, &actor, cli.json)
         }
+
+        cli::Commands::Claim(args) => {
+            cli::claim::execute_claim(args, &mut storage, &actor, cli.json)
+        }
+
+        cli::Commands::Release(args) => {
+            cli::claim::execute_release(args, &mut storage, &actor, cli.json)
+        }
         
         cli::Commands::Close(args) => {
             cli::update::execute_close(args, &mut storage, &actor, cli.json)

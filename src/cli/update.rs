@@ -16,7 +16,7 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub description: Option<String>,
 
-    /// New status
+    /// New status (in_progress alone uses atomic claim)
     #[arg(long, value_parser = clap::value_parser!(Status))]
     pub status: Option<Status>,
 
@@ -28,9 +28,13 @@ pub struct UpdateArgs {
     #[arg(long, value_parser = clap::value_parser!(IssueType))]
     pub issue_type: Option<IssueType>,
 
-    /// New assignee
+    /// Administrative reassignment (requires --force; use claim/release for ownership)
     #[arg(long)]
     pub assignee: Option<String>,
+
+    /// Explicit administrative override of claim/release checks
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -53,18 +57,21 @@ pub struct CommentArgs {
 }
 
 pub fn execute_update(args: UpdateArgs, storage: &mut Box<dyn Storage>, actor: &str, json: bool) -> Result<()> {
-    // Verify issue exists
-    let issue = storage.get_issue(&args.id)?
-        .context(format!("Issue {} not found", args.id))?;
+    if !args.force {
+        if args.assignee.is_some() {
+            anyhow::bail!("Use claim/release for ownership; administrative reassignment requires update --force");
+        }
+        if args.status == Some(Status::InProgress) {
+            if args.title.is_some() || args.description.is_some() || args.priority.is_some() || args.issue_type.is_some() {
+                anyhow::bail!("Claim first, then update other fields; a mixed in_progress update requires --force");
+            }
+            return super::claim::execute_claim(super::claim::ClaimArgs { id: args.id }, storage, actor, json);
+        }
+    }
 
-    // Auto-set assignee if status changes to in_progress and no assignee specified
-    let assignee = if args.assignee.is_some() {
-        args.assignee
-    } else if args.status == Some(Status::InProgress) && issue.assignee.is_empty() {
-        Some(actor.to_string())
-    } else {
-        None
-    };
+    // Verify issue exists
+    storage.get_issue(&args.id)?
+        .context(format!("Issue {} not found", args.id))?;
 
     let updates = IssueUpdates {
         title: args.title,
@@ -75,7 +82,7 @@ pub fn execute_update(args: UpdateArgs, storage: &mut Box<dyn Storage>, actor: &
         status: args.status,
         priority: args.priority,
         issue_type: args.issue_type,
-        assignee,
+        assignee: args.assignee,
         estimated_minutes: None,
         external_ref: None,
     };

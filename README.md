@@ -19,6 +19,12 @@ Requires Rust toolchain: https://rustup.rs/
 
 ## Usage
 
+Generated issue IDs use `<prefix>-<32 lowercase hex characters>` (128 bits of OS
+randomness), so independent clones can create issues without coordinating a counter.
+Use the ID returned by `create` in later commands. Legacy numeric IDs such as `bd-1`
+in the examples below and explicit IDs supplied with `create --id` remain valid and
+are never remapped; duplicate IDs in a database are rejected.
+
 ```bash
 tracer init                                    # Initialize in your project
 tracer create "Task name" -p 1 -t feature     # Create issue

@@ -1,6 +1,6 @@
 use super::{IssueUpdates, Storage};
 use crate::types::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
@@ -122,14 +122,10 @@ impl SqliteStorage {
     }
 
     fn get_next_id(&mut self, prefix: &str) -> Result<String> {
-        let next_num: i64 = self.conn.query_row(
-            "INSERT INTO issue_counters (prefix, last_id) VALUES (?1, 1)
-             ON CONFLICT(prefix) DO UPDATE SET last_id = last_id + 1
-             RETURNING last_id",
-            params![prefix],
-            |row| row.get(0),
-        )?;
-        Ok(format!("{}-{}", prefix, next_num))
+        // Use 128 bits of OS randomness so independent database copies don't share IDs.
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).context("Failed to generate a random issue ID")?;
+        Ok(format!("{}-{}", prefix, hex::encode(random)))
     }
 
     fn mark_dirty(&mut self, issue_id: &str) -> Result<()> {

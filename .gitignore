@@ -23,6 +23,9 @@
 # Testing
 .trace/
 
+# Orb portal metadata
+.amp/portals/
+
 # Coverage
 tarpaulin-report.html
 cobertura.xml

@@ -12,10 +12,11 @@ Lightweight issue tracker for AI agents. Tracks dependencies between tasks and c
 ## Install
 
 ```bash
-cargo install --git https://github.com/Abil-Shrestha/tracer
+cargo install --locked --git https://github.com/Abil-Shrestha/tracer
 ```
 
 Requires Rust 1.89 or newer: https://rustup.rs/
+See [INSTALL.md](./INSTALL.md) for supported platforms and binary archives.
 
 ## Usage
 
@@ -26,36 +27,67 @@ in the examples below and explicit IDs supplied with `create --id` remain valid 
 are never remapped; duplicate IDs in a database are rejected.
 
 ```bash
-tracer init                                    # Initialize in your project
-tracer create "Task name" -p 1 -t feature     # Create issue
-tracer ready                                   # See available work
-tracer update bd-1 --status in_progress       # Start work
-tracer comment bd-1 "Working on this"         # Leave comment
-tracer close bd-1                              # Close issue
+tracer init                                  # Initialize in your project
+tracer create "Task name" -p 1 -t feature --json
+tracer ready --limit 5 --compact              # Discover work, not reserve it
+# Set ISSUE_ID to the returned id, then:
+tracer --actor worker-1 claim "$ISSUE_ID"      # Atomically acquire ready work
+tracer --actor worker-1 comment "$ISSUE_ID" "Working on this"
+tracer --actor worker-1 close "$ISSUE_ID" --reason "Implemented and tested"
 ```
 
 ## Multi-Agent Coordination
 
 ```bash
-# Agent 1 starts work
-tracer --actor agent-1 update bd-1 --status in_progress
-tracer comment bd-1 "Working on auth API"
+# Agent 1 starts work using the ID returned by create
+tracer --actor agent-1 claim "$ISSUE_ID"
+tracer --actor agent-1 comment "$ISSUE_ID" "Working on auth API"
 
-# Agent 2 sees it
-tracer show bd-1  # Shows assignee and comments
-tracer comment bd-1 "I'll test it when ready"
+# Agent 2 can inspect/comment, but cannot steal this claim
+tracer show "$ISSUE_ID" --full --json
+tracer --actor agent-2 comment "$ISSUE_ID" "I'll test it when ready"
 
-# Agent 1 finishes
-tracer close bd-1
+# Agent 1 hands work back without closing it
+tracer --actor agent-1 release "$ISSUE_ID"
 ```
 
-Auto-assigns agent when status changes to in_progress. Comments show up in `tracer show`.
+Claims coordinate agents sharing **one local database**, not disconnected clones.
+Each worker needs a distinct actor name. `update --status in_progress` remains a
+claim alias when used without other updates. See [MULTI_AGENT.md](./MULTI_AGENT.md)
+for readiness, retries, and explicit forced recovery.
+
+## Agent skill and session resume
+
+The bundled [tracking-work-with-tracer skill](./.agents/skills/tracking-work-with-tracer/SKILL.md)
+teaches claiming, handoffs, opaque IDs, and safe conflict recovery. From this
+checkout, copy it into another project's skill directory:
+
+```bash
+mkdir -p /path/to/project/.agents/skills
+cp -R .agents/skills/tracking-work-with-tracer /path/to/project/.agents/skills/
+```
+
+It requires Tracer on `PATH`; it does not install a binary or start a server.
+Use the corresponding skill directory for agents that do not discover
+`.agents/skills`. Restart or reload the agent's skills after installation.
+
+```bash
+tracer --actor worker-1 context --limit 5 --json
+tracer ready --limit 5 --compact --json
+tracer show "$ISSUE_ID" --full --json
+```
+
+`context` reads the existing local cache without importing incoming JSONL or
+changing issue state. It can be stale; `ready` runs normal synchronization. Neither
+command claims work. Complete JSON details, compact summaries, error codes, and
+truncation rules are documented in
+[the agent CLI contract](./docs/agent-cli.md).
 
 ## Features
 
 - Dependency tracking (blocks, parent-child, related, discovered-from)
-- Multi-agent coordination via comments and auto-assign
-- JSON output for AI agents (`--json` flag)
+- Atomic local claims and collaborative comments
+- Structured JSON output and errors, compact summaries, session context
 - Git-friendly storage (JSONL)
 - Auto-discovers database like git does
 
@@ -65,15 +97,19 @@ Auto-assigns agent when status changes to in_progress. Comments show up in `trac
 tracer create "Title" [-p priority] [-t type]
 tracer list [--status STATUS]
 tracer show <id>
+tracer claim <id>
+tracer release <id>
 tracer update <id> --status STATUS
 tracer close <id>
 tracer comment <id> "message"
 tracer dep add <from> <to> --type TYPE
 tracer ready
+tracer context
 tracer stats
 ```
 
-Add `--json` to any command for JSON output.
+Use `--json` for machine-readable command output and errors. `export` writes JSONL;
+`learn` remains a human-readable guide.
 
 ## Sync safety and recovery
 
@@ -142,6 +178,8 @@ unsupported operations fail rather than acknowledge an unsafe publication.
 ## Documentation
 
 - [AGENTS.md](./AGENTS.md) - AI agent integration guide
+- [Agent CLI contract](./docs/agent-cli.md) - JSON output, errors, and session context
+- [P0 acceptance evals](./evals/README.md) - Repeatable CLI safety scenarios
 - [MULTI_AGENT.md](./MULTI_AGENT.md) - Multi-agent coordination
 - [CHANGELOG.md](./CHANGELOG.md) - Version history
 

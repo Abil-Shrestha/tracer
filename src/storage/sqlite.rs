@@ -77,20 +77,6 @@ impl SqliteStorage {
             )?;
         }
 
-        // Sync counters from existing issues if empty
-        let counter_count: i64 = conn.query_row("SELECT COUNT(*) FROM issue_counters", [], |row| row.get(0))?;
-        if counter_count == 0 {
-            conn.execute(
-                "INSERT INTO issue_counters (prefix, last_id)
-                 SELECT substr(id, 1, instr(id, '-') - 1) as prefix,
-                        MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)) as max_id
-                 FROM issues
-                 WHERE instr(id, '-') > 0
-                 GROUP BY prefix",
-                [],
-            )?;
-        }
-
         // Check if external_ref column exists
         let has_external_ref: bool = conn
             .prepare("PRAGMA table_info(issues)")?

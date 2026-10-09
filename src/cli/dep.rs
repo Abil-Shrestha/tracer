@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Args, Subcommand};
+use std::io::Write;
 use tracer::storage::Storage;
 use tracer::types::*;
 
@@ -8,13 +9,13 @@ use tracer::types::*;
 pub enum DepCommands {
     /// Add a dependency
     Add(AddArgs),
-    
+
     /// Remove a dependency
     Remove(RemoveArgs),
-    
+
     /// Show dependency tree
     Tree(TreeArgs),
-    
+
     /// Detect dependency cycles
     Cycles,
 }
@@ -51,11 +52,19 @@ pub struct TreeArgs {
     pub max_depth: i32,
 }
 
-pub fn execute_add(args: AddArgs, storage: &mut Box<dyn Storage>, actor: &str, json: bool) -> Result<()> {
+pub fn execute_add(
+    args: AddArgs,
+    storage: &mut Box<dyn Storage>,
+    actor: &str,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     // Verify both issues exist
-    storage.get_issue(&args.issue_id)?
+    storage
+        .get_issue(&args.issue_id)?
         .context(format!("Issue {} not found", args.issue_id))?;
-    storage.get_issue(&args.depends_on_id)?
+    storage
+        .get_issue(&args.depends_on_id)?
         .context(format!("Issue {} not found", args.depends_on_id))?;
 
     let dep = Dependency {
@@ -69,55 +78,72 @@ pub fn execute_add(args: AddArgs, storage: &mut Box<dyn Storage>, actor: &str, j
     storage.add_dependency(&dep, actor)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&dep)?);
+        writeln!(output, "{}", serde_json::to_string_pretty(&dep)?)?;
     } else {
         use colored::Colorize;
-        println!("✓ Added dependency: {} {} {}", 
+        writeln!(
+            output,
+            "✓ Added dependency: {} {} {}",
             args.issue_id.cyan(),
             format!("--{}-->", args.dep_type).yellow(),
             args.depends_on_id.cyan()
-        );
+        )?;
     }
 
     Ok(())
 }
 
-pub fn execute_remove(args: RemoveArgs, storage: &mut Box<dyn Storage>, actor: &str, json: bool) -> Result<()> {
+pub fn execute_remove(
+    args: RemoveArgs,
+    storage: &mut Box<dyn Storage>,
+    actor: &str,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     storage.remove_dependency(&args.issue_id, &args.depends_on_id, actor)?;
 
     if json {
-        println!("{{\"status\": \"removed\"}}");
+        writeln!(output, "{{\"status\": \"removed\"}}")?;
     } else {
         use colored::Colorize;
-        println!("✓ Removed dependency: {} --x--> {}", 
+        writeln!(
+            output,
+            "✓ Removed dependency: {} --x--> {}",
             args.issue_id.cyan(),
             args.depends_on_id.cyan()
-        );
+        )?;
     }
 
     Ok(())
 }
 
-pub fn execute_tree(args: TreeArgs, storage: &dyn Storage, json: bool) -> Result<()> {
+pub fn execute_tree(
+    args: TreeArgs,
+    storage: &dyn Storage,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     let tree = storage.get_dependency_tree(&args.id, args.max_depth)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&tree)?);
+        writeln!(output, "{}", serde_json::to_string_pretty(&tree)?)?;
     } else {
         if tree.is_empty() {
-            println!("No dependencies found for {}", args.id);
+            writeln!(output, "No dependencies found for {}", args.id)?;
             return Ok(());
         }
 
         use colored::Colorize;
-        println!("Dependency tree for {}:\n", args.id.bold().cyan());
-        
+        writeln!(output, "Dependency tree for {}:\n", args.id.bold().cyan())?;
+
         for node in tree {
             let indent = "  ".repeat(node.depth as usize);
             let connector = if node.depth > 0 { "└─ " } else { "" };
             let truncated_marker = if node.truncated { " [...]" } else { "" };
-            
-            println!("{}{}{} {} [P{}, {}]{}",
+
+            writeln!(
+                output,
+                "{}{}{} {} [P{}, {}]{}",
                 indent,
                 connector,
                 node.issue.id.cyan(),
@@ -125,37 +151,36 @@ pub fn execute_tree(args: TreeArgs, storage: &dyn Storage, json: bool) -> Result
                 node.issue.priority,
                 node.issue.status,
                 truncated_marker
-            );
+            )?;
         }
     }
 
     Ok(())
 }
 
-pub fn execute_cycles(storage: &dyn Storage, json: bool) -> Result<()> {
+pub fn execute_cycles(storage: &dyn Storage, json: bool, output: &mut dyn Write) -> Result<()> {
     let cycles = storage.detect_cycles()?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&cycles)?);
+        writeln!(output, "{}", serde_json::to_string_pretty(&cycles)?)?;
     } else {
         if cycles.is_empty() {
             use colored::Colorize;
-            println!("{} No dependency cycles detected", "✓".green());
+            writeln!(output, "{} No dependency cycles detected", "✓".green())?;
             return Ok(());
         }
 
         use colored::Colorize;
-        println!("{} Found {} cycle(s):\n", "⚠".red(), cycles.len());
-        
+        writeln!(output, "{} Found {} cycle(s):\n", "⚠".red(), cycles.len())?;
+
         for (i, cycle) in cycles.iter().enumerate() {
-            println!("Cycle {}:", i + 1);
+            writeln!(output, "Cycle {}:", i + 1)?;
             for issue in cycle {
-                println!("  → {} {}", issue.id.cyan(), issue.title);
+                writeln!(output, "  → {} {}", issue.id.cyan(), issue.title)?;
             }
-            println!();
+            writeln!(output)?;
         }
     }
 
     Ok(())
 }
-

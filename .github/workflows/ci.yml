@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.89.0
+
+jobs:
+  checks:
+    name: Linux checks (Rust 1.89)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy --component rustfmt
+      - name: Build both command names
+        run: cargo build --locked --bins
+      - name: Test
+        run: cargo test --locked
+      - name: P0 acceptance gate (five scenarios, five rounds)
+        run: python3 evals/p0.py --binary target/debug/tracer --rounds 5 --json
+      - name: Strict Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Formatting
+        if: ${{ !cancelled() }}
+        run: cargo fmt --all -- --check
+
+  package:
+    name: Linux x86-64 static archive
+    needs: checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install packaging toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+      - name: Build reproducible archive and checksums
+        run: |
+          bash scripts/package.sh
+          cp target/dist/SHA256SUMS target/first-SHA256SUMS
+          bash scripts/package.sh
+          cmp target/first-SHA256SUMS target/dist/SHA256SUMS
+      - name: Verify contents and run P0 evals on both extracted binaries
+        run: python3 scripts/verify-package.py target/dist --rounds 5
+      - name: Upload binaries (not a public release)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracer-linux-x86_64-${{ github.sha }}
+          path: |
+            target/dist/*.tar.gz
+            target/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

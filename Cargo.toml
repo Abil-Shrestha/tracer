@@ -2,6 +2,7 @@
 name = "tracer"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.89"
 authors = ["Tracer Contributors"]
 description = "Lightweight issue tracker for AI agents with multi-agent coordination"
 license = "MIT"
@@ -41,6 +42,7 @@ walkdir = "2.4"
 sha2 = "0.10"
 hex = "0.4"
 dirs = "5.0"
+getrandom = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3.8"
@@ -50,4 +52,3 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-

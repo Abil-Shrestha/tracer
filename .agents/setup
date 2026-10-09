@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+echo "Preparing Rust toolchain"
+if ! command -v cc >/dev/null || ! command -v musl-gcc >/dev/null || ! command -v readelf >/dev/null; then
+  sudo apt-get update
+  sudo apt-get install -y build-essential musl-tools binutils
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! command -v rustup >/dev/null; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
+rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy --target x86_64-unknown-linux-musl
+rustup default 1.89.0
+
+echo "Fetching locked dependencies and building Tracer"
+cargo fetch --locked
+cargo build --locked --bins

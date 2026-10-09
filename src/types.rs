@@ -39,7 +39,10 @@ impl Issue {
             anyhow::bail!("title is required");
         }
         if self.title.len() > 500 {
-            anyhow::bail!("title must be 500 characters or less (got {})", self.title.len());
+            anyhow::bail!(
+                "title must be 500 characters or less (got {})",
+                self.title.len()
+            );
         }
         if !(0..=4).contains(&self.priority) {
             anyhow::bail!("priority must be between 0 and 4 (got {})", self.priority);
@@ -279,5 +282,3 @@ pub struct WorkFilter {
     pub assignee: Option<String>,
     pub limit: Option<usize>,
 }
-
-

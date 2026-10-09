@@ -1,4 +1,5 @@
 pub mod storage;
+pub mod sync;
 pub mod types;
 pub mod utils;
 
@@ -27,4 +28,3 @@ pub fn open_storage(path: &PathBuf) -> Result<Box<dyn Storage>> {
 pub fn get_actor() -> String {
     utils::get_actor()
 }
-

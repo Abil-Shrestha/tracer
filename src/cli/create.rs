@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Args;
+use std::io::Write;
 use std::path::PathBuf;
 use tracer::storage::Storage;
 use tracer::types::*;
@@ -44,22 +45,37 @@ pub struct CreateArgs {
     pub file: Option<PathBuf>,
 }
 
-pub fn execute(args: CreateArgs, storage: &mut Box<dyn Storage>, actor: &str, prefix: &str, json: bool) -> Result<()> {
+pub fn execute(
+    args: CreateArgs,
+    storage: &mut Box<dyn Storage>,
+    actor: &str,
+    prefix: &str,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     // File import not yet supported
     if args.file.is_some() {
         anyhow::bail!("Creating from markdown files is not yet implemented");
     }
-    
+
     // Create single issue
     let title = args.title.clone().context("Title is required")?;
-    create_single(args, &title, storage, actor, prefix, json)?;
-    
+    create_single(args, &title, storage, actor, prefix, json, output)?;
+
     Ok(())
 }
 
-fn create_single(args: CreateArgs, title: &str, storage: &mut Box<dyn Storage>, actor: &str, prefix: &str, json: bool) -> Result<()> {
+fn create_single(
+    args: CreateArgs,
+    title: &str,
+    storage: &mut Box<dyn Storage>,
+    actor: &str,
+    prefix: &str,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     let now = Utc::now();
-    
+
     // Generate or use explicit ID
     let id = if let Some(explicit_id) = args.id {
         explicit_id
@@ -107,18 +123,17 @@ fn create_single(args: CreateArgs, title: &str, storage: &mut Box<dyn Storage>, 
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&issue)?);
+        writeln!(output, "{}", serde_json::to_string_pretty(&issue)?)?;
     } else {
         use colored::Colorize;
-        println!("✓ Created issue {} {}", id.bold().cyan(), title);
+        writeln!(output, "✓ Created issue {} {}", id.bold().cyan(), title)?;
         if !args.labels.is_empty() {
-            println!("  Labels: {}", args.labels.join(", "));
+            writeln!(output, "  Labels: {}", args.labels.join(", "))?;
         }
         if !args.deps.is_empty() {
-            println!("  Dependencies: {}", args.deps.join(", "));
+            writeln!(output, "  Dependencies: {}", args.deps.join(", "))?;
         }
     }
 
     Ok(())
 }
-

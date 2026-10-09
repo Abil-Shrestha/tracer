@@ -1,10 +1,12 @@
 use super::{IssueUpdates, Storage};
 use crate::types::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+mod sync;
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -18,20 +20,30 @@ impl SqliteStorage {
         }
 
         let conn = Connection::open(path)?;
-        
+
         // Enable WAL mode for better concurrency
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
         // Initialize schema
         Self::init_schema(&conn)?;
-        
+
+        Ok(Self { conn })
+    }
+
+    /// Observe an existing local cache without initialization or migrations.
+    /// One read transaction keeps multi-query context views consistent.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("Cannot open existing local cache; run tracer ready --json with the same database selection to initialize or refresh it")?;
+        conn.execute_batch("BEGIN DEFERRED")?;
         Ok(Self { conn })
     }
 
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_tables(conn)?;
+        sync::migrate(conn)?;
         Ok(())
     }
 
@@ -52,7 +64,7 @@ impl SqliteStorage {
                     marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
                 );
-                CREATE INDEX idx_dirty_issues_marked_at ON dirty_issues(marked_at);"
+                CREATE INDEX idx_dirty_issues_marked_at ON dirty_issues(marked_at);",
             )?;
         }
 
@@ -70,21 +82,7 @@ impl SqliteStorage {
                 "CREATE TABLE issue_counters (
                     prefix TEXT PRIMARY KEY,
                     last_id INTEGER NOT NULL DEFAULT 0
-                );"
-            )?;
-        }
-
-        // Sync counters from existing issues if empty
-        let counter_count: i64 = conn.query_row("SELECT COUNT(*) FROM issue_counters", [], |row| row.get(0))?;
-        if counter_count == 0 {
-            conn.execute(
-                "INSERT INTO issue_counters (prefix, last_id)
-                 SELECT substr(id, 1, instr(id, '-') - 1) as prefix,
-                        MAX(CAST(substr(id, instr(id, '-') + 1) AS INTEGER)) as max_id
-                 FROM issues
-                 WHERE instr(id, '-') > 0
-                 GROUP BY prefix",
-                [],
+                );",
             )?;
         }
 
@@ -114,7 +112,7 @@ impl SqliteStorage {
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );"
+                );",
             )?;
         }
 
@@ -122,14 +120,10 @@ impl SqliteStorage {
     }
 
     fn get_next_id(&mut self, prefix: &str) -> Result<String> {
-        let next_num: i64 = self.conn.query_row(
-            "INSERT INTO issue_counters (prefix, last_id) VALUES (?1, 1)
-             ON CONFLICT(prefix) DO UPDATE SET last_id = last_id + 1
-             RETURNING last_id",
-            params![prefix],
-            |row| row.get(0),
-        )?;
-        Ok(format!("{}-{}", prefix, next_num))
+        // Use 128 bits of OS randomness so independent database copies don't share IDs.
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).context("Failed to generate a random issue ID")?;
+        Ok(format!("{}-{}", prefix, hex::encode(random)))
     }
 
     fn mark_dirty(&mut self, issue_id: &str) -> Result<()> {
@@ -140,10 +134,18 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn add_event(&mut self, issue_id: &str, event_type: EventType, actor: &str, old_value: Option<&str>, new_value: Option<&str>, comment: Option<&str>) -> Result<()> {
+    fn add_event(
+        &mut self,
+        issue_id: &str,
+        event_type: EventType,
+        actor: &str,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at, sync_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, lower(hex(randomblob(16))))",
             params![
                 issue_id,
                 event_type.to_string(),
@@ -219,6 +221,120 @@ impl Storage for SqliteStorage {
         Ok(issue)
     }
 
+    fn claim_issue(&mut self, id: &str, actor: &str) -> Result<()> {
+        if actor.trim().is_empty() {
+            anyhow::bail!("Claim requires a nonempty actor");
+        }
+
+        // Reserve the write lock before checking ownership or blockers. All checks,
+        // the claim, its audit event, and dirty tracking commit together.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, owner): (String, String) = tx
+            .query_row(
+                "SELECT status, COALESCE(assignee, '') FROM issues WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("Issue {} not found", id))?;
+
+        if !owner.is_empty() && owner != actor {
+            anyhow::bail!("Claim conflict for issue {}: owned by '{}'", id, owner);
+        }
+        if status != "open" && !(status == "in_progress" && owner == actor) {
+            anyhow::bail!(
+                "Claim conflict for issue {}: status '{}' is not ready",
+                id,
+                status
+            );
+        }
+
+        let blocker: Option<String> = tx
+            .query_row(
+                "SELECT blocker.id FROM dependencies d
+             JOIN issues blocker ON blocker.id = d.depends_on_id
+             WHERE d.issue_id = ?1 AND d.type = 'blocks' AND blocker.status != 'closed'
+             ORDER BY blocker.id LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(blocker) = blocker {
+            anyhow::bail!("Claim conflict for issue {}: blocked by {}", id, blocker);
+        }
+
+        // Idempotent retries do not change timestamps or emit duplicate events.
+        if status == "in_progress" && owner == actor {
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        tx.execute(
+            "UPDATE issues SET assignee = ?1, status = 'in_progress', updated_at = ?2,
+             closed_at = NULL WHERE id = ?3",
+            params![actor, now, id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+             VALUES (?1, 'updated', ?2, ?3, ?2, 'Claimed issue', ?4)",
+            params![id, actor, owner, now],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_issues (issue_id) VALUES (?1)",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn release_issue(&mut self, id: &str, actor: &str, force: bool) -> Result<()> {
+        if actor.trim().is_empty() {
+            anyhow::bail!("Release requires a nonempty actor");
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner: String = tx
+            .query_row(
+                "SELECT COALESCE(assignee, '') FROM issues WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("Issue {} not found", id))?;
+        if owner.is_empty() {
+            anyhow::bail!("Release conflict for issue {}: no owner", id);
+        }
+        if owner != actor && !force {
+            anyhow::bail!(
+                "Release conflict for issue {}: owned by '{}'; use --force only for manual recovery",
+                id, owner
+            );
+        }
+
+        let now = Utc::now();
+        tx.execute(
+            "UPDATE issues SET assignee = NULL,
+             status = CASE WHEN status = 'in_progress' THEN 'open' ELSE status END,
+             updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        tx.execute(
+            "INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+             VALUES (?1, 'updated', ?2, ?3, '', ?4, ?5)",
+            params![id, actor, owner, if force { "Force-released issue" } else { "Released issue" }, now],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO dirty_issues (issue_id) VALUES (?1)",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn update_issue(&mut self, id: &str, updates: &IssueUpdates, actor: &str) -> Result<()> {
         let mut sql = String::from("UPDATE issues SET updated_at = ?1");
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(Utc::now())];
@@ -253,7 +369,14 @@ impl Storage for SqliteStorage {
             sql.push_str(&format!(", status = ?{}", param_idx));
             params.push(Box::new(status.to_string()));
             param_idx += 1;
-            self.add_event(id, EventType::StatusChanged, actor, None, Some(&status.to_string()), None)?;
+            self.add_event(
+                id,
+                EventType::StatusChanged,
+                actor,
+                None,
+                Some(&status.to_string()),
+                None,
+            )?;
         }
         if let Some(priority) = updates.priority {
             sql.push_str(&format!(", priority = ?{}", param_idx));
@@ -302,7 +425,11 @@ impl Storage for SqliteStorage {
         let mut conditions = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        if filter.status.is_some() || filter.priority.is_some() || filter.issue_type.is_some() || filter.assignee.is_some() {
+        if filter.status.is_some()
+            || filter.priority.is_some()
+            || filter.issue_type.is_some()
+            || filter.assignee.is_some()
+        {
             if let Some(status) = filter.status {
                 conditions.push(format!("i.status = ?{}", params.len() + 1));
                 params.push(Box::new(status.to_string()));
@@ -323,7 +450,10 @@ impl Storage for SqliteStorage {
 
         if !filter.labels.is_empty() {
             sql.push_str(" LEFT JOIN labels l ON i.id = l.issue_id");
-            let placeholders: Vec<String> = filter.labels.iter().enumerate()
+            let placeholders: Vec<String> = filter
+                .labels
+                .iter()
+                .enumerate()
                 .map(|(idx, _)| format!("?{}", params.len() + idx + 1))
                 .collect();
             conditions.push(format!("l.label IN ({})", placeholders.join(", ")));
@@ -345,27 +475,34 @@ impl Storage for SqliteStorage {
 
         let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let issues = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(Issue {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                design: row.get(3)?,
-                acceptance_criteria: row.get(4)?,
-                notes: row.get(5)?,
-                status: row.get::<_, String>(6)?.parse().expect("Invalid enum value in database"),
-                priority: row.get(7)?,
-                issue_type: row.get::<_, String>(8)?.parse().expect("Invalid enum value in database"),
-                assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                estimated_minutes: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                closed_at: row.get(13)?,
-                external_ref: row.get(14)?,
-                dependencies: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        let issues = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(Issue {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    design: row.get(3)?,
+                    acceptance_criteria: row.get(4)?,
+                    notes: row.get(5)?,
+                    status: row
+                        .get::<_, String>(6)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    priority: row.get(7)?,
+                    issue_type: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    estimated_minutes: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    closed_at: row.get(13)?,
+                    external_ref: row.get(14)?,
+                    dependencies: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(issues)
     }
@@ -382,17 +519,36 @@ impl Storage for SqliteStorage {
                 actor,
             ],
         )?;
-        self.add_event(&dep.issue_id, EventType::DependencyAdded, actor, None, Some(&dep.depends_on_id), None)?;
+        self.add_event(
+            &dep.issue_id,
+            EventType::DependencyAdded,
+            actor,
+            None,
+            Some(&dep.depends_on_id),
+            None,
+        )?;
         self.mark_dirty(&dep.issue_id)?;
         Ok(())
     }
 
-    fn remove_dependency(&mut self, issue_id: &str, depends_on_id: &str, actor: &str) -> Result<()> {
+    fn remove_dependency(
+        &mut self,
+        issue_id: &str,
+        depends_on_id: &str,
+        actor: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "DELETE FROM dependencies WHERE issue_id = ?1 AND depends_on_id = ?2",
             params![issue_id, depends_on_id],
         )?;
-        self.add_event(issue_id, EventType::DependencyRemoved, actor, None, Some(depends_on_id), None)?;
+        self.add_event(
+            issue_id,
+            EventType::DependencyRemoved,
+            actor,
+            None,
+            Some(depends_on_id),
+            None,
+        )?;
         self.mark_dirty(issue_id)?;
         Ok(())
     }
@@ -404,28 +560,35 @@ impl Storage for SqliteStorage {
              JOIN dependencies d ON i.id = d.depends_on_id
              WHERE d.issue_id = ?1"
         )?;
-        
-        let issues = stmt.query_map(params![issue_id], |row| {
-            Ok(Issue {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                design: row.get(3)?,
-                acceptance_criteria: row.get(4)?,
-                notes: row.get(5)?,
-                status: row.get::<_, String>(6)?.parse().expect("Invalid enum value in database"),
-                priority: row.get(7)?,
-                issue_type: row.get::<_, String>(8)?.parse().expect("Invalid enum value in database"),
-                assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                estimated_minutes: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                closed_at: row.get(13)?,
-                external_ref: row.get(14)?,
-                dependencies: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let issues = stmt
+            .query_map(params![issue_id], |row| {
+                Ok(Issue {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    design: row.get(3)?,
+                    acceptance_criteria: row.get(4)?,
+                    notes: row.get(5)?,
+                    status: row
+                        .get::<_, String>(6)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    priority: row.get(7)?,
+                    issue_type: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    estimated_minutes: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    closed_at: row.get(13)?,
+                    external_ref: row.get(14)?,
+                    dependencies: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(issues)
     }
@@ -437,28 +600,35 @@ impl Storage for SqliteStorage {
              JOIN dependencies d ON i.id = d.issue_id
              WHERE d.depends_on_id = ?1"
         )?;
-        
-        let issues = stmt.query_map(params![issue_id], |row| {
-            Ok(Issue {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                design: row.get(3)?,
-                acceptance_criteria: row.get(4)?,
-                notes: row.get(5)?,
-                status: row.get::<_, String>(6)?.parse().expect("Invalid enum value in database"),
-                priority: row.get(7)?,
-                issue_type: row.get::<_, String>(8)?.parse().expect("Invalid enum value in database"),
-                assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                estimated_minutes: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                closed_at: row.get(13)?,
-                external_ref: row.get(14)?,
-                dependencies: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let issues = stmt
+            .query_map(params![issue_id], |row| {
+                Ok(Issue {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    design: row.get(3)?,
+                    acceptance_criteria: row.get(4)?,
+                    notes: row.get(5)?,
+                    status: row
+                        .get::<_, String>(6)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    priority: row.get(7)?,
+                    issue_type: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    estimated_minutes: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    closed_at: row.get(13)?,
+                    external_ref: row.get(14)?,
+                    dependencies: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(issues)
     }
@@ -466,38 +636,46 @@ impl Storage for SqliteStorage {
     fn get_dependency_records(&self, issue_id: &str) -> Result<Vec<Dependency>> {
         let mut stmt = self.conn.prepare(
             "SELECT issue_id, depends_on_id, type, created_at, created_by
-             FROM dependencies WHERE issue_id = ?1"
+             FROM dependencies WHERE issue_id = ?1",
         )?;
-        
-        let deps = stmt.query_map(params![issue_id], |row| {
-            Ok(Dependency {
-                issue_id: row.get(0)?,
-                depends_on_id: row.get(1)?,
-                dep_type: row.get::<_, String>(2)?.parse().expect("Invalid enum value in database"),
-                created_at: row.get(3)?,
-                created_by: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let deps = stmt
+            .query_map(params![issue_id], |row| {
+                Ok(Dependency {
+                    issue_id: row.get(0)?,
+                    depends_on_id: row.get(1)?,
+                    dep_type: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    created_at: row.get(3)?,
+                    created_by: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(deps)
     }
 
     fn get_all_dependency_records(&self) -> Result<Vec<Dependency>> {
         let mut stmt = self.conn.prepare(
-            "SELECT issue_id, depends_on_id, type, created_at, created_by FROM dependencies"
+            "SELECT issue_id, depends_on_id, type, created_at, created_by FROM dependencies",
         )?;
-        
-        let deps = stmt.query_map([], |row| {
-            Ok(Dependency {
-                issue_id: row.get(0)?,
-                depends_on_id: row.get(1)?,
-                dep_type: row.get::<_, String>(2)?.parse().expect("Invalid enum value in database"),
-                created_at: row.get(3)?,
-                created_by: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let deps = stmt
+            .query_map([], |row| {
+                Ok(Dependency {
+                    issue_id: row.get(0)?,
+                    depends_on_id: row.get(1)?,
+                    dep_type: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    created_at: row.get(3)?,
+                    created_by: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(deps)
     }
@@ -513,9 +691,12 @@ impl Storage for SqliteStorage {
         // Simple cycle detection using DFS
         let all_deps = self.get_all_dependency_records()?;
         let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-        
+
         for dep in all_deps {
-            graph.entry(dep.issue_id.clone()).or_default().push(dep.depends_on_id);
+            graph
+                .entry(dep.issue_id.clone())
+                .or_default()
+                .push(dep.depends_on_id);
         }
 
         let mut cycles = Vec::new();
@@ -524,7 +705,14 @@ impl Storage for SqliteStorage {
 
         for node in graph.keys() {
             if !visited.contains(node) {
-                self.dfs_cycle(node, &graph, &mut visited, &mut rec_stack, &mut Vec::new(), &mut cycles)?;
+                self.dfs_cycle(
+                    node,
+                    &graph,
+                    &mut visited,
+                    &mut rec_stack,
+                    &mut Vec::new(),
+                    &mut cycles,
+                )?;
             }
         }
 
@@ -536,7 +724,14 @@ impl Storage for SqliteStorage {
             "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?1, ?2)",
             params![issue_id, label],
         )?;
-        self.add_event(issue_id, EventType::LabelAdded, actor, None, Some(label), None)?;
+        self.add_event(
+            issue_id,
+            EventType::LabelAdded,
+            actor,
+            None,
+            Some(label),
+            None,
+        )?;
         self.mark_dirty(issue_id)?;
         Ok(())
     }
@@ -546,14 +741,24 @@ impl Storage for SqliteStorage {
             "DELETE FROM labels WHERE issue_id = ?1 AND label = ?2",
             params![issue_id, label],
         )?;
-        self.add_event(issue_id, EventType::LabelRemoved, actor, None, Some(label), None)?;
+        self.add_event(
+            issue_id,
+            EventType::LabelRemoved,
+            actor,
+            None,
+            Some(label),
+            None,
+        )?;
         self.mark_dirty(issue_id)?;
         Ok(())
     }
 
     fn get_labels(&self, issue_id: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT label FROM labels WHERE issue_id = ?1")?;
-        let labels = stmt.query_map(params![issue_id], |row| row.get(0))?
+        let mut stmt = self
+            .conn
+            .prepare("SELECT label FROM labels WHERE issue_id = ?1")?;
+        let labels = stmt
+            .query_map(params![issue_id], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(labels)
     }
@@ -565,28 +770,35 @@ impl Storage for SqliteStorage {
              JOIN labels l ON i.id = l.issue_id
              WHERE l.label = ?1"
         )?;
-        
-        let issues = stmt.query_map(params![label], |row| {
-            Ok(Issue {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                design: row.get(3)?,
-                acceptance_criteria: row.get(4)?,
-                notes: row.get(5)?,
-                status: row.get::<_, String>(6)?.parse().expect("Invalid enum value in database"),
-                priority: row.get(7)?,
-                issue_type: row.get::<_, String>(8)?.parse().expect("Invalid enum value in database"),
-                assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                estimated_minutes: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                closed_at: row.get(13)?,
-                external_ref: row.get(14)?,
-                dependencies: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let issues = stmt
+            .query_map(params![label], |row| {
+                Ok(Issue {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    design: row.get(3)?,
+                    acceptance_criteria: row.get(4)?,
+                    notes: row.get(5)?,
+                    status: row
+                        .get::<_, String>(6)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    priority: row.get(7)?,
+                    issue_type: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    estimated_minutes: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    closed_at: row.get(13)?,
+                    external_ref: row.get(14)?,
+                    dependencies: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(issues)
     }
@@ -623,27 +835,34 @@ impl Storage for SqliteStorage {
 
         let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let issues = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(Issue {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                design: row.get(3)?,
-                acceptance_criteria: row.get(4)?,
-                notes: row.get(5)?,
-                status: row.get::<_, String>(6)?.parse().expect("Invalid enum value in database"),
-                priority: row.get(7)?,
-                issue_type: row.get::<_, String>(8)?.parse().expect("Invalid enum value in database"),
-                assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                estimated_minutes: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                closed_at: row.get(13)?,
-                external_ref: row.get(14)?,
-                dependencies: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        let issues = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(Issue {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    design: row.get(3)?,
+                    acceptance_criteria: row.get(4)?,
+                    notes: row.get(5)?,
+                    status: row
+                        .get::<_, String>(6)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    priority: row.get(7)?,
+                    issue_type: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    estimated_minutes: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    closed_at: row.get(13)?,
+                    external_ref: row.get(14)?,
+                    dependencies: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(issues)
     }
@@ -658,48 +877,57 @@ impl Storage for SqliteStorage {
              WHERE d.type = 'blocks' AND blocker.status != 'closed'
              GROUP BY i.id"
         )?;
-        
-        let blocked = stmt.query_map([], |row| {
-            let issue = Issue {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                design: row.get(3)?,
-                acceptance_criteria: row.get(4)?,
-                notes: row.get(5)?,
-                status: row.get::<_, String>(6)?.parse().expect("Invalid enum value in database"),
-                priority: row.get(7)?,
-                issue_type: row.get::<_, String>(8)?.parse().expect("Invalid enum value in database"),
-                assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                estimated_minutes: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                closed_at: row.get(13)?,
-                external_ref: row.get(14)?,
-                dependencies: Vec::new(),
-            };
-            let count: i32 = row.get(15)?;
-            
-            Ok(BlockedIssue {
-                issue,
-                blocked_by_count: count,
-                blocked_by: Vec::new(),
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let blocked = stmt
+            .query_map([], |row| {
+                let issue = Issue {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    design: row.get(3)?,
+                    acceptance_criteria: row.get(4)?,
+                    notes: row.get(5)?,
+                    status: row
+                        .get::<_, String>(6)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    priority: row.get(7)?,
+                    issue_type: row
+                        .get::<_, String>(8)?
+                        .parse()
+                        .expect("Invalid enum value in database"),
+                    assignee: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                    estimated_minutes: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    closed_at: row.get(13)?,
+                    external_ref: row.get(14)?,
+                    dependencies: Vec::new(),
+                };
+                let count: i32 = row.get(15)?;
+
+                Ok(BlockedIssue {
+                    issue,
+                    blocked_by_count: count,
+                    blocked_by: Vec::new(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Get blockers for each blocked issue
         let mut result = Vec::new();
         for mut bi in blocked {
-            let blockers: Vec<String> = self.conn.prepare(
-                "SELECT d.depends_on_id
+            let blockers: Vec<String> = self
+                .conn
+                .prepare(
+                    "SELECT d.depends_on_id
                  FROM dependencies d
                  JOIN issues blocker ON d.depends_on_id = blocker.id
-                 WHERE d.issue_id = ?1 AND d.type = 'blocks' AND blocker.status != 'closed'"
-            )?
-            .query_map(params![&bi.issue.id], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-            
+                 WHERE d.issue_id = ?1 AND d.type = 'blocks' AND blocker.status != 'closed'",
+                )?
+                .query_map(params![&bi.issue.id], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+
             bi.blocked_by = blockers;
             result.push(bi);
         }
@@ -708,50 +936,76 @@ impl Storage for SqliteStorage {
     }
 
     fn add_comment(&mut self, issue_id: &str, actor: &str, comment: &str) -> Result<()> {
-        self.add_event(issue_id, EventType::Commented, actor, None, None, Some(comment))?;
+        self.add_event(
+            issue_id,
+            EventType::Commented,
+            actor,
+            None,
+            None,
+            Some(comment),
+        )?;
+        self.mark_dirty(issue_id)?;
         Ok(())
     }
 
     fn get_events(&self, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+            "SELECT COALESCE(original_id, id), issue_id, event_type, actor, old_value, new_value, comment, created_at
              FROM events
              WHERE issue_id = ?1
              ORDER BY created_at DESC
              LIMIT ?2"
         )?;
-        
-        let events = stmt.query_map(params![issue_id, limit], |row| {
-            Ok(Event {
-                id: row.get(0)?,
-                issue_id: row.get(1)?,
-                event_type: row.get::<_, String>(2)?.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
-                actor: row.get(3)?,
-                old_value: row.get(4)?,
-                new_value: row.get(5)?,
-                comment: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+
+        let events = stmt
+            .query_map(params![issue_id, limit], |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    issue_id: row.get(1)?,
+                    event_type: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    actor: row.get(3)?,
+                    old_value: row.get(4)?,
+                    new_value: row.get(5)?,
+                    comment: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(events)
     }
 
     fn get_statistics(&self) -> Result<Statistics> {
-        let total: i32 = self.conn.query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
-        let open: i32 = self.conn.query_row("SELECT COUNT(*) FROM issues WHERE status = 'open'", [], |row| row.get(0))?;
-        let in_progress: i32 = self.conn.query_row("SELECT COUNT(*) FROM issues WHERE status = 'in_progress'", [], |row| row.get(0))?;
-        let closed: i32 = self.conn.query_row("SELECT COUNT(*) FROM issues WHERE status = 'closed'", [], |row| row.get(0))?;
+        let total: i32 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM issues", [], |row| row.get(0))?;
+        let open: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE status = 'open'",
+            [],
+            |row| row.get(0),
+        )?;
+        let in_progress: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE status = 'in_progress'",
+            [],
+            |row| row.get(0),
+        )?;
+        let closed: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE status = 'closed'",
+            [],
+            |row| row.get(0),
+        )?;
         let blocked: i32 = self.conn.query_row(
             "SELECT COUNT(DISTINCT i.id) FROM issues i
              JOIN dependencies d ON i.id = d.issue_id
              JOIN issues blocker ON d.depends_on_id = blocker.id
              WHERE d.type = 'blocks' AND blocker.status != 'closed'",
             [],
-            |row| row.get(0)
+            |row| row.get(0),
         )?;
-        
+
         let ready: i32 = self.conn.query_row(
             "SELECT COUNT(*) FROM issues i
              WHERE i.status = 'open'
@@ -761,15 +1015,18 @@ impl Storage for SqliteStorage {
                  WHERE d.type = 'blocks' AND blocker.status != 'closed'
              )",
             [],
-            |row| row.get(0)
+            |row| row.get(0),
         )?;
 
-        let avg_lead_time: f64 = self.conn.query_row(
-            "SELECT AVG((julianday(closed_at) - julianday(created_at)) * 24)
+        let avg_lead_time: f64 = self
+            .conn
+            .query_row(
+                "SELECT AVG((julianday(closed_at) - julianday(created_at)) * 24)
              FROM issues WHERE closed_at IS NOT NULL",
-            [],
-            |row| row.get(0)
-        ).unwrap_or(0.0);
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
 
         Ok(Statistics {
             total_issues: total,
@@ -782,9 +1039,36 @@ impl Storage for SqliteStorage {
         })
     }
 
+    fn sync_snapshot(&self) -> Result<Vec<crate::sync::SyncRecord>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let records = self.read_sync_records()?;
+        tx.commit()?;
+        Ok(records)
+    }
+
+    fn import_snapshot(
+        &mut self,
+        records: &[crate::sync::SyncRecord],
+        options: crate::sync::ImportOptions,
+        file_hash: Option<&str>,
+    ) -> Result<crate::sync::ImportSummary> {
+        self.apply_snapshot(records, options, file_hash)
+    }
+
+    fn acknowledge_snapshot(
+        &mut self,
+        records: &[crate::sync::SyncRecord],
+        file_hash: &str,
+    ) -> Result<()> {
+        self.acknowledge_sync(records, file_hash)
+    }
+
     fn get_dirty_issues(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT issue_id FROM dirty_issues ORDER BY marked_at")?;
-        let ids = stmt.query_map([], |row| row.get(0))?
+        let mut stmt = self
+            .conn
+            .prepare("SELECT issue_id FROM dirty_issues ORDER BY marked_at")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(ids)
     }
@@ -799,8 +1083,14 @@ impl Storage for SqliteStorage {
             return Ok(());
         }
         let placeholders: Vec<String> = (1..=issue_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!("DELETE FROM dirty_issues WHERE issue_id IN ({})", placeholders.join(", "));
-        let params: Vec<&dyn rusqlite::ToSql> = issue_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let sql = format!(
+            "DELETE FROM dirty_issues WHERE issue_id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = issue_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
         self.conn.execute(&sql, params.as_slice())?;
         Ok(())
     }
@@ -814,8 +1104,13 @@ impl Storage for SqliteStorage {
     }
 
     fn get_config(&self, key: &str) -> Result<Option<String>> {
-        let value = self.conn
-            .query_row("SELECT value FROM config WHERE key = ?1", params![key], |row| row.get(0))
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(value)
     }
@@ -829,8 +1124,13 @@ impl Storage for SqliteStorage {
     }
 
     fn get_metadata(&self, key: &str) -> Result<Option<String>> {
-        let value = self.conn
-            .query_row("SELECT value FROM metadata WHERE key = ?1", params![key], |row| row.get(0))
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(value)
     }
@@ -841,7 +1141,14 @@ impl Storage for SqliteStorage {
 }
 
 impl SqliteStorage {
-    fn build_tree(&self, issue_id: &str, depth: i32, max_depth: i32, nodes: &mut Vec<TreeNode>, visited: &mut HashSet<String>) -> Result<()> {
+    fn build_tree(
+        &self,
+        issue_id: &str,
+        depth: i32,
+        max_depth: i32,
+        nodes: &mut Vec<TreeNode>,
+        visited: &mut HashSet<String>,
+    ) -> Result<()> {
         if depth >= max_depth || visited.contains(issue_id) {
             return Ok(());
         }
@@ -864,7 +1171,15 @@ impl SqliteStorage {
         Ok(())
     }
 
-    fn dfs_cycle(&self, node: &str, graph: &HashMap<String, Vec<String>>, visited: &mut HashSet<String>, rec_stack: &mut HashSet<String>, path: &mut Vec<String>, cycles: &mut Vec<Vec<Issue>>) -> Result<()> {
+    fn dfs_cycle(
+        &self,
+        node: &str,
+        graph: &HashMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+        rec_stack: &mut HashSet<String>,
+        path: &mut Vec<String>,
+        cycles: &mut Vec<Vec<Issue>>,
+    ) -> Result<()> {
         visited.insert(node.to_string());
         rec_stack.insert(node.to_string());
         path.push(node.to_string());
@@ -875,7 +1190,10 @@ impl SqliteStorage {
                     self.dfs_cycle(neighbor, graph, visited, rec_stack, path, cycles)?;
                 } else if rec_stack.contains(neighbor) {
                     // Cycle detected
-                    let cycle_start = path.iter().position(|n| n == neighbor).expect("Cycle node must be in path");
+                    let cycle_start = path
+                        .iter()
+                        .position(|n| n == neighbor)
+                        .expect("Cycle node must be in path");
                     let cycle_ids: Vec<String> = path[cycle_start..].to_vec();
                     let mut cycle_issues = Vec::new();
                     for id in cycle_ids {
@@ -984,4 +1302,3 @@ CREATE INDEX IF NOT EXISTS idx_labels_issue ON labels(issue_id);
 CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
 CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
 "#;
-

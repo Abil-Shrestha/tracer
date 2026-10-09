@@ -8,13 +8,23 @@ pub trait Storage {
     // Issues
     fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()>;
     fn get_issue(&self, id: &str) -> Result<Option<Issue>>;
+    /// Atomically claim ready work for a nonempty actor. Another owner, a closed/blocked
+    /// status, or an unfinished blocking dependency causes an error without changes.
+    /// Retrying an in-progress claim by the same actor is a no-op if still unblocked.
+    fn claim_issue(&mut self, id: &str, actor: &str) -> Result<()>;
+    /// Clear ownership, returning in-progress work to open but preserving other statuses.
+    /// Only the owner may release unless force is explicitly requested for recovery.
+    fn release_issue(&mut self, id: &str, actor: &str, force: bool) -> Result<()>;
+    /// Administrative mutation, including import/reassignment; not a claim operation.
+    /// Workers must use claim_issue/release_issue for exclusive local ownership.
     fn update_issue(&mut self, id: &str, updates: &IssueUpdates, actor: &str) -> Result<()>;
     fn close_issue(&mut self, id: &str, reason: &str, actor: &str) -> Result<()>;
     fn search_issues(&self, query: &str, filter: &IssueFilter) -> Result<Vec<Issue>>;
 
     // Dependencies
     fn add_dependency(&mut self, dep: &Dependency, actor: &str) -> Result<()>;
-    fn remove_dependency(&mut self, issue_id: &str, depends_on_id: &str, actor: &str) -> Result<()>;
+    fn remove_dependency(&mut self, issue_id: &str, depends_on_id: &str, actor: &str)
+        -> Result<()>;
     fn get_dependencies(&self, issue_id: &str) -> Result<Vec<Issue>>;
     fn get_dependents(&self, issue_id: &str) -> Result<Vec<Issue>>;
     fn get_dependency_records(&self, issue_id: &str) -> Result<Vec<Dependency>>;
@@ -38,6 +48,20 @@ pub trait Storage {
 
     // Statistics
     fn get_statistics(&self) -> Result<Statistics>;
+
+    // Lossless synchronization. Implementations must import/acknowledge atomically.
+    fn sync_snapshot(&self) -> Result<Vec<crate::sync::SyncRecord>>;
+    fn import_snapshot(
+        &mut self,
+        records: &[crate::sync::SyncRecord],
+        options: crate::sync::ImportOptions,
+        file_hash: Option<&str>,
+    ) -> Result<crate::sync::ImportSummary>;
+    fn acknowledge_snapshot(
+        &mut self,
+        records: &[crate::sync::SyncRecord],
+        file_hash: &str,
+    ) -> Result<()>;
 
     // Dirty tracking (for incremental JSONL export)
     fn get_dirty_issues(&self) -> Result<Vec<String>>;
@@ -71,4 +95,3 @@ pub struct IssueUpdates {
     pub estimated_minutes: Option<Option<i32>>, // None = don't update, Some(None) = clear field
     pub external_ref: Option<Option<String>>,
 }
-

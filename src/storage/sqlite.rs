@@ -31,6 +31,15 @@ impl SqliteStorage {
         Ok(Self { conn })
     }
 
+    /// Observe an existing local cache without initialization or migrations.
+    /// One read transaction keeps multi-query context views consistent.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("Cannot open existing local cache; run tracer ready --json with the same database selection to initialize or refresh it")?;
+        conn.execute_batch("BEGIN DEFERRED")?;
+        Ok(Self { conn })
+    }
+
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA)?;
         Self::migrate_tables(conn)?;

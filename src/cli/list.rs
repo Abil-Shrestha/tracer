@@ -1,5 +1,7 @@
+use super::summary::IssueSummary;
 use anyhow::Result;
 use clap::Args;
+use std::io::Write;
 use tracer::storage::Storage;
 use tracer::types::*;
 
@@ -28,9 +30,18 @@ pub struct ListArgs {
     /// Maximum number of results
     #[arg(long)]
     pub limit: Option<usize>,
+
+    /// Return concise summaries instead of full issue records
+    #[arg(long)]
+    pub compact: bool,
 }
 
-pub fn execute(args: ListArgs, storage: &dyn Storage, json: bool) -> Result<()> {
+pub fn execute(
+    args: ListArgs,
+    storage: &dyn Storage,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     let filter = IssueFilter {
         status: args.status,
         priority: args.priority,
@@ -42,21 +53,31 @@ pub fn execute(args: ListArgs, storage: &dyn Storage, json: bool) -> Result<()> 
 
     let issues = storage.search_issues("", &filter)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&issues)?);
+    if args.compact {
+        let summaries: Vec<_> = issues.iter().map(IssueSummary::from).collect();
+        if json {
+            writeln!(output, "{}", serde_json::to_string(&summaries)?)?;
+        } else if summaries.is_empty() {
+            writeln!(output, "No issues found")?;
+        } else {
+            for summary in summaries {
+                writeln!(output, "{summary}")?;
+            }
+        }
+    } else if json {
+        writeln!(output, "{}", serde_json::to_string_pretty(&issues)?)?;
     } else {
         if issues.is_empty() {
-            println!("No issues found");
+            writeln!(output, "No issues found")?;
             return Ok(());
         }
 
-        println!("Found {} issue(s):\n", issues.len());
+        writeln!(output, "Found {} issue(s):\n", issues.len())?;
         for issue in issues {
-            print!("{}", tracer::utils::format_issue(&issue, false));
-            println!();
+            write!(output, "{}", tracer::utils::format_issue(&issue, false))?;
+            writeln!(output)?;
         }
     }
 
     Ok(())
 }
-

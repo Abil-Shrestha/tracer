@@ -42,7 +42,11 @@ pub struct ImportArgs {
     pub dry_run: bool,
 }
 
-pub fn execute_export(args: ExportArgs, storage: &dyn Storage) -> Result<()> {
+pub fn execute_export(
+    args: ExportArgs,
+    storage: &dyn Storage,
+    output: &mut dyn Write,
+) -> Result<()> {
     let mut records = storage.sync_snapshot()?;
     if let Some(status) = args.status {
         records.retain(|r| r.issue.status == status);
@@ -52,14 +56,17 @@ pub fn execute_export(args: ExportArgs, storage: &dyn Storage) -> Result<()> {
     if let Some(path) = args.output {
         sync::publish_atomic(&path, &data)?;
     } else {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(&data)?;
-        stdout.flush()?;
+        output.write_all(&data)?;
     }
     Ok(())
 }
 
-pub fn execute_import(args: ImportArgs, storage: &mut Box<dyn Storage>) -> Result<()> {
+pub fn execute_import(
+    args: ImportArgs,
+    storage: &mut Box<dyn Storage>,
+    json: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
     let data = if let Some(path) = args.input {
         std::fs::read(path)?
     } else {
@@ -78,15 +85,28 @@ pub fn execute_import(args: ImportArgs, storage: &mut Box<dyn Storage>) -> Resul
         dry_run: args.dry_run,
     };
     let summary = storage.import_snapshot(&records, options, None)?;
-    println!(
-        "{}: {} changed, {} removed",
-        if args.dry_run {
-            "Dry run (rolled back)"
-        } else {
-            "Imported"
-        },
-        summary.changed,
-        summary.removed
-    );
+    if json {
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "status": if args.dry_run { "dry_run" } else { "imported" },
+                "changed": summary.changed, "removed": summary.removed,
+                "dry_run": args.dry_run
+            })
+        )?;
+    } else {
+        writeln!(
+            output,
+            "{}: {} changed, {} removed",
+            if args.dry_run {
+                "Dry run (rolled back)"
+            } else {
+                "Imported"
+            },
+            summary.changed,
+            summary.removed
+        )?;
+    }
     Ok(())
 }

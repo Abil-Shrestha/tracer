@@ -80,12 +80,12 @@ pub fn execute(_args: LearnArgs) -> Result<()> {
     // Section 5: Useful Commands
     println!("{}", "⚡ ESSENTIAL COMMANDS".green().bold());
     println!();
-    println!("  {:<25} {}", "tracer ready".yellow(), "Find ready work");
-    println!("  {:<25} {}", "tracer list".yellow(), "List all issues");
-    println!("  {:<25} {}", "tracer show <id>".yellow(), "Show issue details");
-    println!("  {:<25} {}", "tracer comment <id>".yellow(), "Leave a comment");
-    println!("  {:<25} {}", "tracer dep tree <id>".yellow(), "View dependencies");
-    println!("  {:<25} {}", "tracer stats".yellow(), "See statistics");
+    println!("  {:<25} Find ready work", "tracer ready".yellow());
+    println!("  {:<25} List all issues", "tracer list".yellow());
+    println!("  {:<25} Show issue details", "tracer show <id>".yellow());
+    println!("  {:<25} Leave a comment", "tracer comment <id>".yellow());
+    println!("  {:<25} View dependencies", "tracer dep tree <id>".yellow());
+    println!("  {:<25} See statistics", "tracer stats".yellow());
     println!();
 
     // Section 6: Tips
@@ -100,10 +100,10 @@ pub fn execute(_args: LearnArgs) -> Result<()> {
     // Section 7: Dependency Types
     println!("{}", "📎 DEPENDENCY TYPES".green().bold());
     println!();
-    println!("  {:<20} {}", "blocks".yellow(), "Hard blocker (affects ready work)");
-    println!("  {:<20} {}", "parent-child".yellow(), "Epic/subtask relationship");
-    println!("  {:<20} {}", "discovered-from".yellow(), "Found during other work");
-    println!("  {:<20} {}", "related".yellow(), "Soft connection");
+    println!("  {:<20} Hard blocker (affects ready work)", "blocks".yellow());
+    println!("  {:<20} Epic/subtask relationship", "parent-child".yellow());
+    println!("  {:<20} Found during other work", "discovered-from".yellow());
+    println!("  {:<20} Soft connection", "related".yellow());
     println!();
 
     // Section 8: Resources

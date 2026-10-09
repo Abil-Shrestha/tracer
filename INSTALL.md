@@ -1,192 +1,120 @@
 # Installation Guide
 
-## Quick Install (Recommended)
+Tracer installs two command names, **`tracer`** and **`tr`**, with the same CLI.
+There is no `trace` command. No crates.io package, Homebrew tap, or distribution
+package is currently advertised; use this repository or verified build artifacts.
 
-### From Source
+## Supported platform
+
+Linux x86-64 is the supported and tested platform. The downloadable archive targets
+`x86_64-unknown-linux-musl` and contains statically linked binaries, including
+SQLite; no Rust installation or system SQLite is required to run them.
+
+macOS, Windows, ARM, and other targets are **not currently supported downloads**.
+In particular, snapshot publication opens and fsyncs the containing directory after
+atomic rename. That implementation needs platform-specific validation (and changes
+on Windows), not just a successful cross-compile. Tests do not simulate hardware
+power loss. Use a local filesystem; network filesystem durability/locking has not
+been validated.
+
+## Install from source
+
+Install [Rust](https://rustup.rs/) **1.89 or newer** and a C toolchain. Rust 1.89 is
+required for the standard-library file locking used by synchronization.
+On Debian/Ubuntu, the build tools can be installed with:
 
 ```bash
-# Clone the repository
+sudo apt-get update
+sudo apt-get install -y build-essential
+```
+
+Then clone and install both commands using the committed dependency lockfile:
+
+```bash
 git clone https://github.com/Abil-Shrestha/tracer.git
 cd tracer
-
-# Build and install
-cargo install --path .
-```
-
-The `trace` binary will be installed to `~/.cargo/bin/` (make sure it's in your PATH).
-
-### Using Cargo
-
-```bash
-cargo install trace-tracker
-```
-
-## Platform-Specific Instructions
-
-### macOS
-
-**Option 1: Homebrew (Coming Soon)**
-```bash
-brew tap Abil-Shrestha/tracer
-brew install tracer
-```
-
-**Option 2: From Source**
-```bash
-# Install Rust if not already installed
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install tracer
-cargo install --git https://github.com/Abil-Shrestha/tracer
-```
-
-### Linux
-
-**Ubuntu/Debian:**
-```bash
-# Install build dependencies
-sudo apt update
-sudo apt install build-essential pkg-config libssl-dev
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install tracer
-cargo install --git https://github.com/Abil-Shrestha/tracer
-```
-
-**Arch Linux (Coming Soon):**
-```bash
-yay -S trace-git
-```
-
-**From Binary:**
-```bash
-# Download from releases
-wget https://github.com/Abil-Shrestha/tracer/releases/latest/download/tracer-linux-amd64
-
-# Make executable
-chmod +x tracer-linux-amd64
-
-# Move to PATH
-sudo mv tracer-linux-amd64 /usr/local/bin/tracer
-```
-
-### Windows
-
-**Option 1: From Source**
-```powershell
-# Install Rust from https://rustup.rs/
-
-# Install tracer
-cargo install --git https://github.com/Abil-Shrestha/tracer
-```
-
-**Option 2: From Binary**
-```powershell
-# Download from releases
-# https://github.com/Abil-Shrestha/tracer/releases/latest
-
-# Add to PATH or run from download location
-.\tracer.exe --help
-```
-
-## Verification
-
-After installation, verify it works:
-
-```bash
+cargo install --locked --path . --bins
+export PATH="$HOME/.cargo/bin:$PATH"
 tracer --version
+tr --version
+```
+
+For a particular version, check out its reviewed tag or commit before installing.
+The source build bundles SQLite and does not require OpenSSL or a SQLite development
+package. A native Linux source build may depend on the host's libc; it is not the
+static download build described below.
+
+## Install a binary artifact
+
+The **CI** and manually dispatched **Prepare release artifacts** workflows produce
+an Actions artifact named `tracer-linux-x86_64-<commit>`. They do **not** create or
+publish a GitHub Release. Download the artifact from a successful, trusted workflow
+run for the commit you intend to install; GitHub may require you to sign in. Artifacts
+expire after 14 days. Do not assume a `releases/latest/download` URL exists.
+
+After unzipping the Actions download, it contains:
+
+```text
+tracer-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+SHA256SUMS
+```
+
+From that directory, verify the archive **before** extracting it. Change `version`
+to match the downloaded archive; do not mix files from different workflow runs.
+
+```bash
+version=0.2.0
+archive="tracer-v${version}-x86_64-unknown-linux-musl"
+sha256sum --check SHA256SUMS
+tar -xzf "${archive}.tar.gz"
+mkdir -p "$HOME/.local/bin"
+install -m 755 "${archive}/tracer" "${archive}/tr" "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
+tracer --version
+tr --version
+```
+
+Stop if checksum verification fails. SHA-256 detects corruption; it is not a
+signature or proof that an untrusted workflow is safe. Inspect the run's source
+commit and provenance before executing its binaries.
+
+The archive also includes `LICENSE`, `README.md`, this guide, `BUILD-INFO` (source
+commit, target, Rust version, and source timestamp), and the agent skill at
+`.agents/skills/tracking-work-with-tracer/SKILL.md`. See the README's skill
+installation instructions. Keep these files when redistributing the archive.
+
+## Verify and start
+
+```bash
 tracer --help
+tracer init
+tracer create "My first task" --json
+tracer ready --json
 ```
 
-## Updating
+`tr` accepts the same commands. For behavioral validation in a source checkout,
+the [P0 evals](evals/README.md) accept an absolute `--binary` path and use disposable
+data, never your existing tracker.
 
-### Cargo Install
-```bash
-cargo install trace-tracker --force
-```
+## Update or uninstall
 
-### From Source
-```bash
-cd tracer
-git pull
-cargo install --path . --force
-```
+For a source installation, fetch and review the desired revision, check it out,
+then run `cargo install --locked --path . --bins --force`. Uninstall both commands
+with `cargo uninstall tracer`.
 
-### Homebrew
-```bash
-brew upgrade tracer
-```
-
-## Uninstalling
-
-```bash
-cargo uninstall tracer
-```
+For a binary installation, repeat the checksum/extract/install steps for the new
+artifact. To uninstall, remove only the `tracer` and `tr` files you installed in
+`~/.local/bin`. Neither uninstall method removes your tracker data.
 
 ## Troubleshooting
 
-### Command not found
+- **Command not found:** add the installation directory (`~/.cargo/bin` or
+  `~/.local/bin`) to your shell's PATH. Use `command -v tracer` and `command -v tr`
+  to check for an older installation shadowing the new one.
+- **Old Rust:** run `rustup update stable` and check `rustc --version` is at least
+  1.89. See [CONTRIBUTING.md](CONTRIBUTING.md) for the exact CI toolchain.
+- **C compiler missing:** install `build-essential` before building bundled SQLite.
+- **Sync/publication failure:** do not discard the database or assume the mutation
+  did not happen. Follow the recovery guidance in the [README](README.md).
 
-Make sure `~/.cargo/bin` is in your PATH:
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-### Build fails on Windows
-
-Make sure you have the Visual C++ build tools installed:
-- Download from: https://visualstudio.microsoft.com/downloads/
-- Install "Desktop development with C++"
-
-### SQLite errors
-
-Trace uses bundled SQLite, so no external dependencies needed. If you see SQLite errors, try:
-
-```bash
-# Clean and rebuild
-cargo clean
-cargo build --release
-```
-
-## Development Installation
-
-For contributing or testing:
-
-```bash
-# Clone repo
-git clone https://github.com/Abil-Shrestha/tracer.git
-cd tracer
-
-# Build in debug mode
-cargo build
-
-# Run tests
-cargo test
-
-# Run from source
-cargo run -- --help
-
-# Build optimized version
-cargo build --release
-
-# Binary will be in target/release/tracer
-```
-
-## Next Steps
-
-After installation:
-
-1. Initialize in your project: `tracer init`
-2. Create your first issue: `tracer create "My first task"`
-3. See ready work: `tracer ready`
-4. Read the [README](README.md) for full documentation
-
-## Getting Help
-
-- Check the [FAQ](README.md#faq) in the README
-- [Open an issue](https://github.com/Abil-Shrestha/tracer/issues) on GitHub
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) for development help
+See [CONTRIBUTING.md](CONTRIBUTING.md) for checks, packaging, and release preparation.

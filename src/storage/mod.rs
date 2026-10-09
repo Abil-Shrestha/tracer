@@ -23,7 +23,8 @@ pub trait Storage {
 
     // Dependencies
     fn add_dependency(&mut self, dep: &Dependency, actor: &str) -> Result<()>;
-    fn remove_dependency(&mut self, issue_id: &str, depends_on_id: &str, actor: &str) -> Result<()>;
+    fn remove_dependency(&mut self, issue_id: &str, depends_on_id: &str, actor: &str)
+        -> Result<()>;
     fn get_dependencies(&self, issue_id: &str) -> Result<Vec<Issue>>;
     fn get_dependents(&self, issue_id: &str) -> Result<Vec<Issue>>;
     fn get_dependency_records(&self, issue_id: &str) -> Result<Vec<Dependency>>;
@@ -50,8 +51,17 @@ pub trait Storage {
 
     // Lossless synchronization. Implementations must import/acknowledge atomically.
     fn sync_snapshot(&self) -> Result<Vec<crate::sync::SyncRecord>>;
-    fn import_snapshot(&mut self, records: &[crate::sync::SyncRecord], options: crate::sync::ImportOptions, file_hash: Option<&str>) -> Result<crate::sync::ImportSummary>;
-    fn acknowledge_snapshot(&mut self, records: &[crate::sync::SyncRecord], file_hash: &str) -> Result<()>;
+    fn import_snapshot(
+        &mut self,
+        records: &[crate::sync::SyncRecord],
+        options: crate::sync::ImportOptions,
+        file_hash: Option<&str>,
+    ) -> Result<crate::sync::ImportSummary>;
+    fn acknowledge_snapshot(
+        &mut self,
+        records: &[crate::sync::SyncRecord],
+        file_hash: &str,
+    ) -> Result<()>;
 
     // Dirty tracking (for incremental JSONL export)
     fn get_dirty_issues(&self) -> Result<Vec<String>>;

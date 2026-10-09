@@ -20,18 +20,20 @@ pub fn find_database_path() -> Result<PathBuf> {
     // 3. Fall back to home directory default
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let default_db = home.join(".trace").join("default.db");
-    
+
     // Create parent directory if it doesn't exist
     if let Some(parent) = default_db.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     Ok(default_db)
 }
 
 /// Find the JSONL path for a given database path
 pub fn find_jsonl_path(db_path: &Path) -> PathBuf {
-    let parent = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
 
     // Backups and filtered exports must never become the managed sync file.
     parent.join("issues.jsonl")
@@ -40,7 +42,7 @@ pub fn find_jsonl_path(db_path: &Path) -> PathBuf {
 /// Walk up the directory tree looking for .trace/*.db
 fn find_database_in_tree() -> Result<Option<PathBuf>> {
     let mut current = env::current_dir()?;
-    
+
     loop {
         let trace_dir = current.join(".trace");
         if trace_dir.is_dir() {
@@ -55,13 +57,13 @@ fn find_database_in_tree() -> Result<Option<PathBuf>> {
                 }
             }
         }
-        
+
         // Move up one directory
         if !current.pop() {
             break;
         }
     }
-    
+
     Ok(None)
 }
 
@@ -87,9 +89,9 @@ pub fn parse_dependency_spec(spec: &str) -> Result<(crate::types::DependencyType
 /// Format issue for display with colors
 pub fn format_issue(issue: &crate::types::Issue, with_description: bool) -> String {
     use colored::Colorize;
-    
+
     let mut output = String::new();
-    
+
     // Header line: ID, title, [priority, type]
     output.push_str(&format!(
         "{} {} [{}, {}]\n",
@@ -98,7 +100,7 @@ pub fn format_issue(issue: &crate::types::Issue, with_description: bool) -> Stri
         format!("P{}", issue.priority).yellow(),
         issue.issue_type.to_string().green()
     ));
-    
+
     // Status and assignee
     let status_colored = match issue.status {
         crate::types::Status::Open => "open".green(),
@@ -107,31 +109,34 @@ pub fn format_issue(issue: &crate::types::Issue, with_description: bool) -> Stri
         crate::types::Status::Closed => "closed".dimmed(),
     };
     output.push_str(&format!("  Status: {}\n", status_colored));
-    
+
     if !issue.assignee.is_empty() {
         output.push_str(&format!("  Assignee: {}\n", issue.assignee));
     }
-    
+
     if let Some(est) = issue.estimated_minutes {
         output.push_str(&format!("  Estimated: {} minutes\n", est));
     }
-    
+
     // Description
     if with_description && !issue.description.is_empty() {
         output.push_str(&format!("\n  {}\n", issue.description));
     }
-    
+
     // Timestamps
     output.push_str(&format!(
         "  Created: {} | Updated: {}\n",
         issue.created_at.format("%Y-%m-%d %H:%M"),
         issue.updated_at.format("%Y-%m-%d %H:%M")
     ));
-    
+
     if let Some(closed_at) = issue.closed_at {
-        output.push_str(&format!("  Closed: {}\n", closed_at.format("%Y-%m-%d %H:%M")));
+        output.push_str(&format!(
+            "  Closed: {}\n",
+            closed_at.format("%Y-%m-%d %H:%M")
+        ));
     }
-    
+
     output
 }
 

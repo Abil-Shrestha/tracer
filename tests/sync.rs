@@ -475,7 +475,10 @@ fn failed_cli_publication_returns_failure_and_keeps_dirty_comment_for_retry() {
         .status
         .success());
     let storage = SqliteStorage::new(&path).unwrap();
-    assert_eq!(storage.get_dirty_issues().unwrap(), [issue.id.clone()]);
+    assert_eq!(
+        storage.get_dirty_issues().unwrap(),
+        std::slice::from_ref(&issue.id)
+    );
     assert_eq!(storage.get_events(&issue.id, 100).unwrap().len(), 2);
     drop(storage);
     fs::remove_file(&jsonl).unwrap();

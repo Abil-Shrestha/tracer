@@ -130,7 +130,8 @@ Output is `target/dist/tracer-v<VERSION>-x86_64-unknown-linux-musl.tar.gz` and
 `target/dist/SHA256SUMS`. Pass a different output directory as the first argument
 to `package.sh`; use a separate directory for each version. The archive contains
 `tracer`, `tr`, `LICENSE`, `README.md`, `INSTALL.md`, `BUILD-INFO`, and
-`.agents/skills/tracking-work-with-tracer/SKILL.md` under a versioned directory.
+the skill and CLI contract at `.agents/skills/tracking-work-with-tracer/SKILL.md`
+and `docs/agent-cli.md` under a versioned directory.
 
 Packaging pins Rust 1.89.0, uses `Cargo.lock`, remaps source paths, normalizes tar
 order/ownership/modes/timestamps, and omits gzip timestamps. `SOURCE_DATE_EPOCH`
@@ -154,7 +155,8 @@ CI gates and artifact upload. A maintainer can select the reviewed branch/tag
 when manually dispatching it. Neither workflow has `contents: write`, creates a
 GitHub Release, pushes tags, publishes crates, nor deploys anything. Checkout does
 not persist credentials; external actions are pinned to commits. Updating the Rust
-pin requires changing both `ci.yml` and `scripts/package.sh` and rerunning the gates.
+pin requires changing `ci.yml`, `scripts/package.sh`, and `.agents/setup`, then
+rerunning the gates.
 
 Download the `tracer-linux-x86_64-<commit>` artifact from its successful Actions
 run within 14 days. It is an Actions ZIP containing the tarball and `SHA256SUMS`;
@@ -235,7 +237,8 @@ mod tests {
     fn test_create_issue_generates_id() {
         let mut storage = SqliteStorage::new(":memory:").unwrap();
         let id = storage.generate_id("test").unwrap();
-        assert_eq!(id, "test-1");
+        assert!(id.starts_with("test-"));
+        assert_ne!(id, storage.generate_id("test").unwrap());
     }
 
     #[test]

@@ -19,8 +19,8 @@ def verify(directory, rounds):
     name = filename.removesuffix(".tar.gz")
     version = name.removeprefix("tracer-v").removesuffix("-x86_64-unknown-linux-musl")
     files = {"tracer", "tr", "LICENSE", "README.md", "INSTALL.md", "BUILD-INFO",
-             ".agents/skills/tracking-work-with-tracer/SKILL.md"}
-    directories = {"", ".agents", ".agents/skills", ".agents/skills/tracking-work-with-tracer"}
+             ".agents/skills/tracking-work-with-tracer/SKILL.md", "docs/agent-cli.md"}
+    directories = {"", "docs", ".agents", ".agents/skills", ".agents/skills/tracking-work-with-tracer"}
     expected = {f"{name}/{path}" if path else name for path in files | directories}
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="tracer-package-") as temporary:

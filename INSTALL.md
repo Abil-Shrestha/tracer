@@ -80,8 +80,9 @@ commit and provenance before executing its binaries.
 
 The archive also includes `LICENSE`, `README.md`, this guide, `BUILD-INFO` (source
 commit, target, Rust version, and source timestamp), and the agent skill at
-`.agents/skills/tracking-work-with-tracer/SKILL.md`. See the README's skill
-installation instructions. Keep these files when redistributing the archive.
+`.agents/skills/tracking-work-with-tracer/SKILL.md`, with its output and recovery
+contract in `docs/agent-cli.md`. See the README's skill installation instructions.
+Keep these files when redistributing the archive.
 
 ## Verify and start
 

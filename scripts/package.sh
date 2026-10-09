@@ -34,9 +34,10 @@ name="tracer-v$version-$target"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 skill=.agents/skills/tracking-work-with-tracer/SKILL.md
-mkdir -p "$stage/$name/$(dirname "$skill")"
+mkdir -p "$stage/$name/$(dirname "$skill")" "$stage/$name/docs"
 install -m 644 LICENSE README.md INSTALL.md "$stage/$name/"
 install -m 644 "$skill" "$stage/$name/$skill"
+install -m 644 docs/agent-cli.md "$stage/$name/docs/"
 
 cargo build --locked --release --target "$target" --bins
 for binary in tracer tr; do

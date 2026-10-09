@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "trace")]
+#[command(name = "tracer")]
 #[command(about = "Lightweight issue tracker for AI agents", long_about = None)]
 #[command(version)]
 pub struct Cli {
